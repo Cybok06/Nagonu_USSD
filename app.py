@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import os
 
+import re
+
 from flask import Flask, jsonify, request
 
 from nagonu_store import normalize_phone
 from ussd_nagonu import handle as handle_nagonu
+from ussd_state import get_session as get_nagonu_session
 from ussd_state import log_request
 from ussd_zico import handle as handle_zico
+from ussd_zico_state import get_session as get_zico_session
 from ussd_zico_state import log_request as log_zico_request
 from zico_store import active_agent_code_exists as zico_agent_code_exists
 
@@ -20,9 +24,29 @@ def create_app() -> Flask:
             return request.get_json(silent=True) or {}
         return request.form if request.method == "POST" else request.args
 
+    def _is_true(value):
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"1", "true", "yes", "y"}
+
+    def _clean_ussd_text(value):
+        return (
+            str(value or "")
+            .replace("＃", "#")
+            .replace("＊", "*")
+            .replace("%23", "#")
+            .strip()
+        )
+
     def _arkesel_text(payload):
-        text = str(payload.get("userData") or "").strip()
-        if not bool(payload.get("newSession")):
+        text = _clean_ussd_text(
+            payload.get("userData")
+            or payload.get("message")
+            or payload.get("text")
+            or payload.get("ussdString")
+            or ""
+        )
+        if not _is_true(payload.get("newSession")):
             return text
         if not (text.startswith("*") and text.endswith("#")):
             return text
@@ -30,6 +54,13 @@ def create_app() -> Flask:
         if len(parts) <= 1:
             return ""
         return "*".join(parts[1:])
+
+    def _strip_leading_dial_parts(text):
+        parts = [p.strip() for p in _clean_ussd_text(text).strip("*#").split("*") if p.strip()]
+        for idx, part in enumerate(parts):
+            if re.fullmatch(r"\d{5}", part):
+                return "*".join(parts[idx:])
+        return ""
 
     def _request_values():
         payload = _payload()
@@ -50,7 +81,7 @@ def create_app() -> Flask:
         text = (
             _arkesel_text(payload)
             if request.is_json
-            else str(payload.get("text") or payload.get("ussdString") or "").strip()
+            else _clean_ussd_text(payload.get("text") or payload.get("ussdString") or payload.get("userData") or "")
         )
         if not session_id:
             session_id = f"session-{phone or 'unknown'}"
@@ -90,17 +121,30 @@ def create_app() -> Flask:
     @app.route("/ussd", methods=["GET", "POST"])
     def ussd_shared():
         session_id, phone, text = _request_values()
-        first_entry = next((p.strip() for p in text.split("*") if p.strip()), "")
+        zico_session = get_zico_session(session_id, phone)
+        nagonu_session = get_nagonu_session(session_id, phone)
+
+        if zico_session and not nagonu_session:
+            response = handle_zico(session_id, phone, text)
+            log_zico_request("zico", session_id, phone, text, response)
+            return _respond(response)
+        if nagonu_session and not zico_session:
+            response = handle_nagonu(session_id, phone, text)
+            log_request("nagonu", session_id, phone, text, response)
+            return _respond(response)
+
+        routed_text = _strip_leading_dial_parts(text)
+        first_entry = next((p.strip() for p in routed_text.split("*") if p.strip()), "")
         if not first_entry:
             response = "CON Welcome to DataWeb USSD\nEnter agent code:"
             return _respond(response)
 
         if zico_agent_code_exists(first_entry):
-            response = handle_zico(session_id, phone, text)
-            log_zico_request("zico", session_id, phone, text, response)
+            response = handle_zico(session_id, phone, routed_text)
+            log_zico_request("zico", session_id, phone, routed_text, response)
         else:
-            response = handle_nagonu(session_id, phone, text)
-            log_request("nagonu", session_id, phone, text, response)
+            response = handle_nagonu(session_id, phone, routed_text)
+            log_request("nagonu", session_id, phone, routed_text, response)
         return _respond(response)
 
     @app.route("/ussd/zico", methods=["GET", "POST"])
@@ -125,4 +169,5 @@ app = create_app()
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    debug = os.getenv("FLASK_DEBUG", "0").strip().lower() in {"1", "true", "yes"}
+    app.run(host="0.0.0.0", port=port, debug=debug)

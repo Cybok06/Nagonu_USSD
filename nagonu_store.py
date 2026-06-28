@@ -33,6 +33,8 @@ def to_oid(value: Any) -> Optional[ObjectId]:
 
 def normalize_phone(raw: Any) -> str:
     digits = re.sub(r"\D+", "", str(raw or ""))
+    if digits.startswith("2330") and len(digits) == 13:
+        return digits[3:]
     if digits.startswith("233") and len(digits) == 12:
         return "0" + digits[3:]
     if len(digits) == 9:
