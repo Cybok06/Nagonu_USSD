@@ -8,10 +8,14 @@ from flask import Flask, jsonify, request
 
 from nagonu_store import normalize_phone
 from ussd_nagonu import handle as handle_nagonu
+from ussd_state import get_recent_agent_code as get_nagonu_recent_agent_code
 from ussd_state import get_session as get_nagonu_session
+from ussd_state import get_unfinished_session as get_nagonu_unfinished_session
 from ussd_state import log_request
 from ussd_zico import handle as handle_zico
+from ussd_zico_state import get_recent_agent_code as get_zico_recent_agent_code
 from ussd_zico_state import get_session as get_zico_session
+from ussd_zico_state import get_unfinished_session as get_zico_unfinished_session
 from ussd_zico_state import log_request as log_zico_request
 from zico_store import active_agent_code_exists as zico_agent_code_exists
 
@@ -136,6 +140,14 @@ def create_app() -> Flask:
         routed_text = _strip_leading_dial_parts(text)
         first_entry = next((p.strip() for p in routed_text.split("*") if p.strip()), "")
         if not first_entry:
+            if get_zico_unfinished_session(phone) or get_zico_recent_agent_code(phone, "zico"):
+                response = handle_zico(session_id, phone, "")
+                log_zico_request("zico", session_id, phone, "", response)
+                return _respond(response)
+            if get_nagonu_unfinished_session(phone) or get_nagonu_recent_agent_code(phone, "nagonu"):
+                response = handle_nagonu(session_id, phone, "")
+                log_request("nagonu", session_id, phone, "", response)
+                return _respond(response)
             response = "CON Enter Agent code to continue"
             return _respond(response)
 
