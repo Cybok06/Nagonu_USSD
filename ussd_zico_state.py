@@ -122,3 +122,23 @@ def create_pending_order(data: Dict[str, Any]) -> str:
     result = pending_orders_col.insert_one(doc)
     pending_orders_col.update_one({"_id": result.inserted_id}, {"$set": {"id": str(result.inserted_id)}})
     return str(result.inserted_id)
+
+
+def mark_pending_order_created(pending_id: str, order_id: str) -> None:
+    try:
+        from bson import ObjectId
+
+        oid = ObjectId(str(pending_id))
+    except Exception:
+        oid = None
+    query = {"_id": oid} if oid else {"id": str(pending_id)}
+    pending_orders_col.update_one(
+        query,
+        {
+            "$set": {
+                "status": "order_created",
+                "order_id": order_id,
+                "updated_at": now_utc(),
+            }
+        },
+    )

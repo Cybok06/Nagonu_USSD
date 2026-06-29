@@ -18,7 +18,9 @@ from ussd_zico_state import (
     get_unfinished_session,
     remember_agent_code,
     save_session,
+    mark_pending_order_created,
 )
+from zico_ussd_orders import create_zico_ussd_order
 
 
 APP_NAME = "zico"
@@ -275,8 +277,14 @@ def handle(session_id: str, phone: str, text: str) -> str:
             }
         )
         data["pending_order_id"] = pending_id
-        save_session(session_id, phone, "payment_pending", data)
-        return end("Order saved. Mobile money payment will be added next.")
+        created = create_zico_ussd_order(data, session_id, phone)
+        if not created.get("success"):
+            save_session(session_id, phone, "confirm_order", data)
+            return con(f"{created.get('message') or 'Order could not be placed.'}\n1. Try Again\n2. Cancel")
+        data["order_id"] = created.get("order_id")
+        mark_pending_order_created(pending_id, created.get("order_id") or "")
+        end_session(session_id, phone)
+        return end(f"Order placed successfully.\nOrder ID: {created.get('order_id')}")
 
     if state == "latest_order":
         return _service_menu(session_id, phone, data)

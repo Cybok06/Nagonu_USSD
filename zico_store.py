@@ -196,7 +196,7 @@ def _svc_offers(service: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _offer_base_amount(offer: Dict[str, Any]) -> Optional[float]:
-    for field in ("customer_price", "store_amount", "amount", "total", "price"):
+    for field in ("store_amount", "amount", "total", "price", "customer_price"):
         val = money(offer.get(field), None)
         if val is not None:
             return val
