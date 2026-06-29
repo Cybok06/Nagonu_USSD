@@ -47,7 +47,7 @@ def _start(session_id: str, phone: str) -> str:
     recent = get_recent_agent_code(phone, APP_NAME)
     if recent and recent.get("agent_code"):
         save_session(session_id, phone, "reuse_agent_code", {"recent_agent_code": recent.get("agent_code")})
-        return con(f"Use agent code {recent.get('agent_code')} again?\n1. Yes\n2. No")
+        return con(f"Do you want to continue with your recent agent code ({recent.get('agent_code')})?\n1. Yes\n2. No")
 
     save_session(session_id, phone, "enter_agent_code", {})
     return con("Welcome to AZICO USSD\nEnter agent code:")

@@ -136,7 +136,7 @@ def create_app() -> Flask:
         routed_text = _strip_leading_dial_parts(text)
         first_entry = next((p.strip() for p in routed_text.split("*") if p.strip()), "")
         if not first_entry:
-            response = "CON Welcome to DataWeb USSD\nEnter agent code:"
+            response = "CON Enter Agent code to continue"
             return _respond(response)
 
         if zico_agent_code_exists(first_entry):
