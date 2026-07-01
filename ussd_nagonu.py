@@ -22,6 +22,7 @@ from ussd_state import (
     mark_pending_order_created,
 )
 from nagonu_ussd_orders import create_nagonu_ussd_order
+from nagonu_paystack import initiate_payment, submit_otp, verify_payment
 
 
 APP_NAME = "nagonu"
@@ -148,7 +149,10 @@ def handle(session_id: str, phone: str, text: str) -> str:
 
     if state == "resume_unfinished":
         if entry == "1":
-            save_session(session_id, phone, "payment_pending", data)
+            next_state = "otp_pending" if data.get("paystack_requires_otp") else "payment_pending"
+            save_session(session_id, phone, next_state, data)
+            if next_state == "otp_pending":
+                return con("Enter the OTP/voucher code sent by your network:")
             return con("Payment is still pending.\n1. Check payment\n2. Cancel")
         end_session(session_id, phone)
         save_session(session_id, phone, "enter_agent_code", {})
@@ -282,9 +286,31 @@ def handle(session_id: str, phone: str, text: str) -> str:
             save_session(session_id, phone, "confirm_order", data)
             return con(f"{created.get('message') or 'Order could not be placed.'}\n1. Try Again\n2. Cancel")
         data["order_id"] = created.get("order_id")
+        data["charged_amount"] = created.get("charged_amount")
+        data["gateway_fee"] = created.get("gateway_fee")
         mark_pending_order_created(pending_id, created.get("order_id") or "")
-        end_session(session_id, phone)
-        return end(f"Order placed successfully.\nOrder ID: {created.get('order_id')}")
+        payment = initiate_payment(created, data, session_id, phone)
+        data["paystack_reference"] = payment.get("reference")
+        data["payment_status"] = payment.get("status")
+
+        if not payment.get("success"):
+            save_session(session_id, phone, "confirm_order", data)
+            return con(f"{payment.get('message') or 'Payment could not be started.'}\n1. Try Again\n2. Cancel")
+
+        if payment.get("status") == "success":
+            end_session(session_id, phone)
+            return end(f"Payment received. Order processing started.\nOrder ID: {created.get('order_id')}")
+
+        if payment.get("status") == "send_otp":
+            data["paystack_requires_otp"] = True
+            save_session(session_id, phone, "otp_pending", data)
+            return con(f"{payment.get('message') or 'Enter OTP/voucher code'}:")
+
+        save_session(session_id, phone, "payment_pending", data)
+        return end(
+            "Payment prompt sent to your phone.\n"
+            f"Approve GHS {float(created.get('charged_amount') or 0):.2f} to process order {created.get('order_id')}."
+        )
 
     if state == "latest_order":
         return _service_menu(session_id, phone, data)
@@ -293,6 +319,40 @@ def handle(session_id: str, phone: str, text: str) -> str:
         if entry == "2":
             end_session(session_id, phone)
             return end("Payment session cancelled.")
+        reference = data.get("paystack_reference") or ""
+        checked = verify_payment(reference) if reference else {"success": False, "status": "not_found"}
+        status = checked.get("status")
+        if checked.get("success") and checked.get("released_provider_processing"):
+            end_session(session_id, phone)
+            return end(f"Payment confirmed. Order processing started.\nOrder ID: {data.get('order_id') or ''}")
+        if status == "success":
+            end_session(session_id, phone)
+            return end(f"Payment confirmed.\nOrder ID: {data.get('order_id') or ''}")
+        if status == "send_otp":
+            data["paystack_requires_otp"] = True
+            save_session(session_id, phone, "otp_pending", data)
+            return con(f"{checked.get('message') or 'Enter OTP/voucher code'}:")
+        if status in {"failed", "abandoned", "reversed", "timeout"}:
+            end_session(session_id, phone)
+            return end("Payment failed or expired. Please start again.")
+        save_session(session_id, phone, "payment_pending", data)
         return con("Payment is still pending.\n1. Check payment\n2. Cancel")
+
+    if state == "otp_pending":
+        reference = data.get("paystack_reference") or ""
+        result = submit_otp(reference, entry)
+        status = result.get("status")
+        if result.get("success") and status == "success":
+            end_session(session_id, phone)
+            return end(f"Payment confirmed. Order processing started.\nOrder ID: {data.get('order_id') or ''}")
+        if result.get("success") and status in {"pending", "pay_offline", "processing"}:
+            data["paystack_requires_otp"] = False
+            save_session(session_id, phone, "payment_pending", data)
+            return end("Payment prompt sent. Please approve on your phone.")
+        if result.get("success") and status == "send_otp":
+            save_session(session_id, phone, "otp_pending", data)
+            return con(f"{result.get('message') or 'Enter OTP/voucher code'}:")
+        save_session(session_id, phone, "otp_pending", data)
+        return con(f"{result.get('message') or 'Invalid OTP/voucher.'}\nEnter OTP/voucher code:")
 
     return _start(session_id, phone)

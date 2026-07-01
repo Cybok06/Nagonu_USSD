@@ -7,6 +7,7 @@ import re
 from flask import Flask, jsonify, request
 
 from nagonu_store import normalize_phone
+from nagonu_paystack import handle_webhook as handle_nagonu_paystack_webhook
 from ussd_nagonu import handle as handle_nagonu
 from ussd_state import get_recent_agent_code as get_nagonu_recent_agent_code
 from ussd_state import get_session as get_nagonu_session
@@ -121,6 +122,14 @@ def create_app() -> Flask:
     @app.route("/", methods=["GET"])
     def index():
         return "USSD Runner is running", 200
+
+    @app.route("/paystack/nagonu/webhook", methods=["POST"])
+    @app.route("/paystack/webhook", methods=["POST"])
+    def paystack_nagonu_webhook():
+        raw_body = request.get_data() or b""
+        signature = request.headers.get("x-paystack-signature") or request.headers.get("X-Paystack-Signature") or ""
+        payload, status_code = handle_nagonu_paystack_webhook(raw_body, signature)
+        return jsonify(payload), status_code
 
     @app.route("/ussd", methods=["GET", "POST"])
     def ussd_shared():

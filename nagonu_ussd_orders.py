@@ -337,14 +337,27 @@ def create_nagonu_ussd_order(data: Dict[str, Any], session_id: str, dial_phone: 
     if not is_valid_gh_phone(recipient):
         return {"success": False, "message": "Invalid recipient phone number."}
 
-    existing = orders_col.find_one({"ussd.session_id": session_id}, {"order_id": 1, "status": 1})
+    existing = orders_col.find_one(
+        {"ussd.session_id": session_id},
+        {"order_id": 1, "status": 1, "total_amount": 1, "charged_amount": 1, "payment_status": 1, "paystack_reference": 1},
+    )
     if existing:
-        return {"success": True, "order_id": existing.get("order_id"), "status": existing.get("status"), "idempotent": True}
+        return {
+            "success": True,
+            "order_id": existing.get("order_id"),
+            "status": existing.get("status"),
+            "charged_amount": _money(existing.get("charged_amount") or existing.get("total_amount")),
+            "payment_status": existing.get("payment_status"),
+            "paystack_reference": existing.get("paystack_reference"),
+            "idempotent": True,
+        }
 
     order_id = checkout.generate_order_id()
     line, job = _build_line_and_job(order_id, {**data, "recipient": recipient})
     created_now = datetime.utcnow()
     amount = _money(data.get("amount"))
+    paystack_fee = round(amount * 0.02, 2)
+    charged_amount = round(amount + paystack_fee, 2)
     store_profit_total = _money(line.get("store_profit_amount"))
     order_doc = {
         "user_id": to_oid(data.get("agent_user_id")) or store.get("owner_id"),
@@ -352,11 +365,18 @@ def create_nagonu_ussd_order(data: Dict[str, Any], session_id: str, dial_phone: 
         "order_id": order_id,
         "items": [line],
         "total_amount": amount,
-        "charged_amount": amount,
+        "charged_amount": charged_amount,
         "profit_amount_total": _money(line.get("profit_amount")),
-        "status": "processing",
+        "status": "awaiting_payment",
         "paid_from": "ussd",
+        "payment_provider": "paystack",
+        "payment_reference": "",
+        "payment_gateway": "Paystack",
+        "payment_status": "pending",
+        "payment_channel": "mobile_money",
         "paystack_reference": "",
+        "paystack_charged_amount": charged_amount,
+        "paystack_fee_amount": paystack_fee,
         "created_at": created_now,
         "updated_at": created_now,
         "ussd": {
@@ -364,42 +384,101 @@ def create_nagonu_ussd_order(data: Dict[str, Any], session_id: str, dial_phone: 
             "dial_phone": normalize_phone(dial_phone),
             "agent_code": data.get("agent_code"),
             "pending_order_id": data.get("pending_order_id"),
+            "provider_jobs": [job] if job else [],
         },
         "debug": {
             "store_checkout": True,
             "ussd_checkout": True,
             "events": [],
-            "paystack_paid_ghs": amount,
-            "paystack_expected_ghs": amount,
-            "gateway_fee_overage_ghs": 0.0,
+            "paystack_paid_ghs": 0.0,
+            "paystack_expected_ghs": charged_amount,
+            "paystack_base_ghs": amount,
+            "paystack_fee_ghs": paystack_fee,
+            "gateway_fee_overage_ghs": paystack_fee,
             "skipped_count": 0,
         },
     }
     orders_col.insert_one(order_doc)
 
-    if store_profit_total > 0:
+    return {
+        "success": True,
+        "order_id": order_id,
+        "status": "awaiting_payment",
+        "charged_amount": charged_amount,
+        "base_amount": amount,
+        "gateway_fee": paystack_fee,
+        "items": [line],
+    }
+
+
+def release_nagonu_ussd_order(order_id: str, payment: Dict[str, Any], paystack_data: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    if not order_id:
+        return {"released": False, "reason": "missing_order_id"}
+
+    order = orders_col.find_one({"order_id": order_id})
+    if not order:
+        return {"released": False, "reason": "order_not_found"}
+
+    now = datetime.utcnow()
+    reference = payment.get("paystack_reference") or payment.get("payment_reference") or (paystack_data or {}).get("reference") or ""
+    paid_amount = _money(payment.get("amount") or order.get("charged_amount"))
+    base_amount = _money(payment.get("base_amount") or order.get("total_amount"))
+    gateway_fee = _money(payment.get("gateway_fee") or max(0.0, paid_amount - base_amount))
+
+    orders_col.update_one(
+        {"order_id": order_id},
+        {
+            "$set": {
+                "status": "processing",
+                "payment_status": "success",
+                "payment_reference": reference,
+                "paystack_reference": reference,
+                "payment_verified_at": now,
+                "payment_raw": paystack_data or {},
+                "paystack_charged_amount": paid_amount,
+                "paystack_fee_amount": gateway_fee,
+                "charged_amount": paid_amount,
+                "debug.paystack_paid_ghs": paid_amount,
+                "debug.paystack_expected_ghs": paid_amount,
+                "debug.paystack_base_ghs": base_amount,
+                "debug.paystack_fee_ghs": gateway_fee,
+                "updated_at": now,
+            }
+        },
+    )
+
+    store_slug = order.get("store_slug")
+    store_profit_total = _money(sum(_money(item.get("store_profit_amount")) for item in (order.get("items") or [])))
+    credit_claim = orders_col.update_one(
+        {"order_id": order_id, "store_profit_credited_at": {"$exists": False}},
+        {"$set": {"store_profit_credited_at": now, "updated_at": now}},
+    )
+    if credit_claim.modified_count and store_slug and store_profit_total > 0:
         store_accounts_col.update_one(
-            {"store_slug": order_doc["store_slug"]},
+            {"store_slug": store_slug},
             {
                 "$inc": {"total_profit_balance": store_profit_total},
-                "$set": {"last_updated_profit": store_profit_total, "updated_at": datetime.utcnow()},
-                "$setOnInsert": {"store_slug": order_doc["store_slug"], "created_at": datetime.utcnow()},
+                "$set": {"last_updated_profit": store_profit_total, "updated_at": now},
+                "$setOnInsert": {"store_slug": store_slug, "created_at": now},
             },
             upsert=True,
         )
 
+    release_claim = orders_col.update_one(
+        {"order_id": order_id, "ussd.provider_released_at": {"$exists": False}},
+        {"$set": {"ussd.provider_released_at": now, "updated_at": now}},
+    )
+    if not release_claim.modified_count:
+        return {"released": False, "reason": "already_released", "order_id": order_id}
+
+    items = order.get("items") or []
     try:
-        checkout._send_mashup_order_sms_async(order_id, created_now, [line])
+        checkout._send_mashup_order_sms_async(order_id, order.get("created_at") or now, items)
     except Exception:
         pass
 
-    if job:
-        threading.Thread(target=checkout._background_process_providers, args=(order_id, [job]), daemon=True).start()
+    jobs = ((order.get("ussd") or {}).get("provider_jobs") or [])
+    if jobs:
+        threading.Thread(target=checkout._background_process_providers, args=(order_id, jobs), daemon=True).start()
 
-    return {
-        "success": True,
-        "order_id": order_id,
-        "status": "processing",
-        "charged_amount": amount,
-        "items": [line],
-    }
+    return {"released": True, "order_id": order_id, "jobs": len(jobs)}
