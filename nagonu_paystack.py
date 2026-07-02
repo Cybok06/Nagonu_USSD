@@ -243,7 +243,7 @@ def initiate_payment(order: Dict[str, Any], session_data: Dict[str, Any], sessio
         "session_id": session_id,
     }
     body = {
-        "email": f"ussd-{payer_phone}@nagonu.local",
+        "email": f"ussd-{payer_phone}@nagonu.com",
         "amount": expected_pesewas,
         "currency": "GHS",
         "reference": reference,
