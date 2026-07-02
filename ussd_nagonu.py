@@ -45,8 +45,14 @@ def _start(session_id: str, phone: str) -> str:
     unfinished = get_unfinished_session(phone)
     if unfinished:
         data = unfinished.get("data") or {}
-        save_session(session_id, phone, "resume_unfinished", {"resume_session_id": unfinished.get("session_id"), **data})
-        return con("You have an unfinished payment session.\n1. Continue\n2. Start New")
+        state = unfinished.get("state") or ""
+        save_session(session_id, phone, state, data)
+        if state == "confirm_order":
+            return con(_confirmation(data))
+        if state == "otp_pending":
+            return con("Enter the OTP/voucher code sent by your network:")
+        if state == "payment_pending":
+            return con("Payment is still pending.\n1. Check payment\n2. Cancel")
 
     recent = get_recent_agent_code(phone, APP_NAME)
     if recent and recent.get("agent_code"):

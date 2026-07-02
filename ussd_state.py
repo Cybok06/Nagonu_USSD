@@ -13,6 +13,7 @@ logs_col = db["ussd_request_logs"]
 
 SESSION_TTL_MINUTES = 30
 RECENT_CODE_DAYS = 30
+RESUMABLE_STATES = ["confirm_order", "payment_pending", "otp_pending"]
 
 
 def now_utc() -> datetime:
@@ -79,7 +80,7 @@ def get_unfinished_session(phone: str) -> Optional[Dict[str, Any]]:
         {
             "phone": phone,
             "status": "active",
-            "state": {"$in": ["payment_pending", "otp_pending"]},
+            "state": {"$in": RESUMABLE_STATES},
             "updated_at": {"$gte": cutoff},
         },
         sort=[("updated_at", -1)],
