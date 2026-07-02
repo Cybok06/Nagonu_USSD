@@ -89,8 +89,10 @@ def _build_line_and_job(order_id: str, data: Dict[str, Any]) -> tuple[Dict[str, 
     value_obj = checkout._coerce_value_obj(data.get("value"))
     amount = _money(data.get("amount"))
     system_base = _system_base_for_value(svc_doc, value_obj, data.get("base_amount"))
-    store_profit_amount = max(0.0, round(amount - system_base, 2))
-    profit_percent_used = round((store_profit_amount / system_base * 100), 2) if system_base > 0 else 0.0
+    store_base = _money(data.get("base_amount"), system_base)
+    profit_amount = max(0.0, round(store_base - system_base, 2))
+    profit_percent_used = round((profit_amount / system_base * 100), 2) if system_base > 0 else 0.0
+    store_profit_amount = max(0.0, round(amount - store_base, 2))
     network_id = checkout._resolve_network_id({"serviceId": service_id, "serviceName": svc_name}, value_obj, svc_doc)
     bundle_key = checkout._build_bundle_key(value_obj if isinstance(value_obj, dict) else {}, {"value": data.get("value")})
     amount_key = checkout._normalize_amount_key(amount)
@@ -98,9 +100,10 @@ def _build_line_and_job(order_id: str, data: Dict[str, Any]) -> tuple[Dict[str, 
 
     base_line = {
         "phone": phone,
-        "base_amount": system_base,
+        "base_amount": store_base,
+        "system_base_amount": system_base,
         "amount": amount,
-        "profit_amount": 0.0,
+        "profit_amount": profit_amount,
         "profit_percent_used": profit_percent_used,
         "store_profit_amount": store_profit_amount,
         **ported_fields,
@@ -192,17 +195,12 @@ def _build_line_and_job(order_id: str, data: Dict[str, Any]) -> tuple[Dict[str, 
         provider_mode = None
         provider_amount = None
         key = (codecraft_network, provider_gig)
-        if codecraft_network == "TELECEL":
-            if regular_map and key in regular_map:
-                provider_mode = "regular"
-                provider_amount = regular_map.get(key)
-        else:
-            if bigtime_map and key in bigtime_map:
-                provider_mode = "bigtime"
-                provider_amount = bigtime_map.get(key)
-            elif regular_map and key in regular_map:
-                provider_mode = "regular"
-                provider_amount = regular_map.get(key)
+        if bigtime_map and key in bigtime_map:
+            provider_mode = "bigtime"
+            provider_amount = bigtime_map.get(key)
+        elif regular_map and key in regular_map:
+            provider_mode = "regular"
+            provider_amount = regular_map.get(key)
         if not codecraft_network or not provider_gig or not provider_mode:
             return _line_for_manual(
                 base_line,
@@ -328,6 +326,14 @@ def _build_line_and_job(order_id: str, data: Dict[str, Any]) -> tuple[Dict[str, 
     ), None
 
 
+def _stage_line_until_payment(line: Dict[str, Any]) -> Dict[str, Any]:
+    staged = dict(line)
+    staged["line_status"] = "awaiting_payment"
+    staged["api_status"] = "awaiting_payment"
+    staged["api_response"] = {"note": "Waiting for Paystack payment confirmation before processing."}
+    return staged
+
+
 def create_nagonu_ussd_order(data: Dict[str, Any], session_id: str, dial_phone: str) -> Dict[str, Any]:
     loaded = validate_agent_code(data.get("agent_code") or "")
     if not loaded:
@@ -354,16 +360,16 @@ def create_nagonu_ussd_order(data: Dict[str, Any], session_id: str, dial_phone: 
 
     order_id = checkout.generate_order_id()
     line, job = _build_line_and_job(order_id, {**data, "recipient": recipient})
+    staged_line = _stage_line_until_payment(line)
     created_now = datetime.utcnow()
     amount = _money(data.get("amount"))
     paystack_fee = round(amount * 0.02, 2)
     charged_amount = round(amount + paystack_fee, 2)
-    store_profit_total = _money(line.get("store_profit_amount"))
     order_doc = {
         "user_id": to_oid(data.get("agent_user_id")) or store.get("owner_id"),
         "store_slug": store.get("slug") or data.get("store_slug"),
         "order_id": order_id,
-        "items": [line],
+        "items": [staged_line],
         "total_amount": amount,
         "charged_amount": charged_amount,
         "profit_amount_total": _money(line.get("profit_amount")),
@@ -384,6 +390,7 @@ def create_nagonu_ussd_order(data: Dict[str, Any], session_id: str, dial_phone: 
             "dial_phone": normalize_phone(dial_phone),
             "agent_code": data.get("agent_code"),
             "pending_order_id": data.get("pending_order_id"),
+            "release_items": [line],
             "provider_jobs": [job] if job else [],
         },
         "debug": {
@@ -407,7 +414,7 @@ def create_nagonu_ussd_order(data: Dict[str, Any], session_id: str, dial_phone: 
         "charged_amount": charged_amount,
         "base_amount": amount,
         "gateway_fee": paystack_fee,
-        "items": [line],
+        "items": [staged_line],
     }
 
 
@@ -425,10 +432,13 @@ def release_nagonu_ussd_order(order_id: str, payment: Dict[str, Any], paystack_d
     base_amount = _money(payment.get("base_amount") or order.get("total_amount"))
     gateway_fee = _money(payment.get("gateway_fee") or max(0.0, paid_amount - base_amount))
 
+    release_items = ((order.get("ussd") or {}).get("release_items") or order.get("items") or [])
+
     orders_col.update_one(
         {"order_id": order_id},
         {
             "$set": {
+                "items": release_items,
                 "status": "processing",
                 "payment_status": "success",
                 "payment_reference": reference,
@@ -448,7 +458,7 @@ def release_nagonu_ussd_order(order_id: str, payment: Dict[str, Any], paystack_d
     )
 
     store_slug = order.get("store_slug")
-    store_profit_total = _money(sum(_money(item.get("store_profit_amount")) for item in (order.get("items") or [])))
+    store_profit_total = _money(sum(_money(item.get("store_profit_amount")) for item in release_items))
     credit_claim = orders_col.update_one(
         {"order_id": order_id, "store_profit_credited_at": {"$exists": False}},
         {"$set": {"store_profit_credited_at": now, "updated_at": now}},
@@ -471,7 +481,7 @@ def release_nagonu_ussd_order(order_id: str, payment: Dict[str, Any], paystack_d
     if not release_claim.modified_count:
         return {"released": False, "reason": "already_released", "order_id": order_id}
 
-    items = order.get("items") or []
+    items = release_items
     try:
         checkout._send_mashup_order_sms_async(order_id, order.get("created_at") or now, items)
     except Exception:
